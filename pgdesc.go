@@ -16,6 +16,12 @@ import (
 
 // Postgres RELKIND and other related constants.
 const (
+	COERCION_CODE_ASSIGNMENT  = 'a' // coercion in context of assignment
+	COERCION_CODE_EXPLICIT    = 'e' // explicit cast operation
+	COERCION_CODE_IMPLICIT    = 'i' // coercion in context of expression
+	COERCION_METHOD_BINARY    = 'b' // types are binary-compatible
+	COERCION_METHOD_FUNCTION  = 'f' // use a function
+	COERCION_METHOD_INOUT     = 'i' // use input/output functions
 	DEFACLOBJ_FUNCTION        = 'f' // function
 	DEFACLOBJ_NAMESPACE       = 'n' // namespace
 	DEFACLOBJ_RELATION        = 'r' // table, view
@@ -214,38 +220,58 @@ func (d *PgDesc) Casts(w io.Writer, pattern string, verbose bool) error {
 
 	// initPQExpBuffer(w);
 
-	/*
-	 * We need a left join to pg_proc for binary casts; the others are just
-	 * paranoia.  Also note that we don't attempt to localize '(binary
-	 * coercible)', because there's too much risk of gettext translating a
-	 * function name that happens to match some string in the PO database.
-	 */
 	fmt.Fprintf(w,
 		"SELECT pg_catalog.format_type(castsource, NULL) AS \"%s\",\n"+
-			"       pg_catalog.format_type(casttarget, NULL) AS \"%s\",\n"+
-			"       CASE WHEN castfunc = 0 THEN '(binary coercible)'\n"+
-			"            ELSE p.proname\n"+
-			"       END as \"%s\",\n"+
-			"       CASE WHEN c.castcontext = 'e' THEN '%s'\n"+
-			"            WHEN c.castcontext = 'a' THEN '%s'\n"+
-			"            ELSE '%s'\n"+
-			"       END as \"%s\"",
+			"       pg_catalog.format_type(casttarget, NULL) AS \"%s\",\n",
 		GettextNoop("Source type"),
-		GettextNoop("Target type"),
-		GettextNoop("Function"),
+		GettextNoop("Target type"))
+
+	/*
+	 * We don't attempt to localize '(binary coercible)' or '(with inout)',
+	 * because there's too much risk of gettext translating a function name
+	 * that happens to match some string in the PO database.
+	 */
+	if d.version >= 80400 {
+		fmt.Fprintf(w,
+			"       CASE WHEN c.castmethod = '%c' THEN '(binary coercible)'\n"+
+				"            WHEN c.castmethod = '%c' THEN '(with inout)'\n"+
+				"            ELSE p.proname\n"+
+				"       END AS \"%s\",\n",
+			COERCION_METHOD_BINARY,
+			COERCION_METHOD_INOUT,
+			GettextNoop("Function"))
+	} else {
+		fmt.Fprintf(w,
+			"       CASE WHEN c.castfunc = 0 THEN '(binary coercible)'\n"+
+				"            ELSE p.proname\n"+
+				"       END AS \"%s\",\n",
+			GettextNoop("Function"))
+	}
+
+	fmt.Fprintf(w,
+		"       CASE WHEN c.castcontext = '%c' THEN '%s'\n"+
+			"            WHEN c.castcontext = '%c' THEN '%s'\n"+
+			"            ELSE '%s'\n"+
+			"       END AS \"%s\"",
+		COERCION_CODE_EXPLICIT,
 		GettextNoop("no"),
+		COERCION_CODE_ASSIGNMENT,
 		GettextNoop("in assignment"),
 		GettextNoop("yes"),
 		GettextNoop("Implicit?"))
 
 	if verbose {
 		fmt.Fprintf(w,
-			",\n       d.description AS \"%s\"\n",
+			",\n       d.description AS \"%s\"",
 			GettextNoop("Description"))
 	}
 
+	/*
+	 * We need a left join to pg_proc for binary casts; the others are just
+	 * paranoia.
+	 */
 	fmt.Fprint(w,
-		"FROM pg_catalog.pg_cast c LEFT JOIN pg_catalog.pg_proc p\n"+
+		"\nFROM pg_catalog.pg_cast c LEFT JOIN pg_catalog.pg_proc p\n"+
 			"     ON c.castfunc = p.oid\n"+
 			"     LEFT JOIN pg_catalog.pg_type ts\n"+
 			"     ON c.castsource = ts.oid\n"+
@@ -821,7 +847,7 @@ func (d *PgDesc) EventTriggers(w io.Writer, pattern string, verbose bool) error 
 		GettextNoop("always"),
 		GettextNoop("disabled"),
 		GettextNoop("Enabled"),
-		GettextNoop("Procedure"),
+		GettextNoop("Function"),
 		GettextNoop("Tags"))
 	if verbose {
 		fmt.Fprintf(w,
@@ -1248,6 +1274,7 @@ func (d *PgDesc) Functions(w io.Writer, functypes string, pattern string, verbos
 
 	var showAggregate bool = strchr(functypes, 'a') != NULL
 	var showNormal bool = strchr(functypes, 'n') != NULL
+	var showProcedure bool = strchr(functypes, 'p') != NULL
 	var showTrigger bool = strchr(functypes, 't') != NULL
 	var showWindow bool = strchr(functypes, 'w') != NULL
 	var have_where bool
@@ -1259,21 +1286,25 @@ func (d *PgDesc) Functions(w io.Writer, functypes string, pattern string, verbos
 	/* No "Parallel" column before 9.6 */
 	// static const bool translate_columns_pre_96[] = {false, false, false, false, true, true, false, true, false, false, false, false};
 
-	if strlen(functypes) != strspn(functypes, "antwS+") {
-		return fmt.Errorf("\\df only takes [antwS+] as options\n")
+	if strlen(functypes) != strspn(functypes, "anptwS+") {
+		return fmt.Errorf("\\df only takes [anptwS+] as options\n")
 		// return true;
 	}
 
-	if showWindow && d.version < 80400 {
+	if showProcedure && d.version < 110000 {
 		// char sverbuf[32];
 
-		return fmt.Errorf("\\df does not take a \"w\" option with server version %s\n",
+		return fmt.Errorf("\\df does not take a \"%c\" option with server version %s\n",
+			'p',
 			d.sversion)
 		// return true;
 	}
 
-	if !showAggregate && !showNormal && !showTrigger && !showWindow {
+	if !showAggregate && !showNormal && !showProcedure && !showTrigger && !showWindow {
 		showAggregate, showNormal, showTrigger = true, true, true
+		if d.version >= 110000 {
+			showProcedure = true
+		}
 		if d.version >= 80400 {
 			showWindow = true
 		}
@@ -1440,7 +1471,7 @@ func (d *PgDesc) Functions(w io.Writer, functypes string, pattern string, verbos
 	have_where = false
 
 	/* filter by function type, if requested */
-	if showNormal && showAggregate && showTrigger && showWindow {
+	if showNormal && showAggregate && showProcedure && showTrigger && showWindow {
 		/* Do nothing */
 	} else if showNormal {
 		if !showAggregate {
@@ -1455,6 +1486,15 @@ func (d *PgDesc) Functions(w io.Writer, functypes string, pattern string, verbos
 			} else {
 				fmt.Fprint(w, "NOT p.proisagg\n")
 			}
+		}
+		if !showProcedure && d.version >= 110000 {
+			if have_where {
+				fmt.Fprint(w, "      AND ")
+			} else {
+				fmt.Fprint(w, "WHERE ")
+				have_where = true
+			}
+			fmt.Fprint(w, "p.prokind <> 'p'\n")
 		}
 		if !showTrigger {
 			if have_where {
@@ -1498,6 +1538,13 @@ func (d *PgDesc) Functions(w io.Writer, functypes string, pattern string, verbos
 			}
 			fmt.Fprint(w,
 				"p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype\n")
+			needs_or = true
+		}
+		if showProcedure {
+			if needs_or {
+				fmt.Fprint(w, "       OR ")
+			}
+			fmt.Fprint(w, "p.prokind = 'p'\n")
 			needs_or = true
 		}
 		if showWindow {
@@ -2172,7 +2219,7 @@ func (d *PgDesc) Permissions(w io.Writer, pattern string) error {
 		GettextNoop("materialized view"),
 		GettextNoop("sequence"),
 		GettextNoop("foreign table"),
-		GettextNoop("table"), /* partitioned table */
+		GettextNoop("partitioned table"),
 		GettextNoop("Type"))
 
 	d.printACLColumn(w, "c.relacl")
@@ -2950,8 +2997,8 @@ func (d *PgDesc) Tables(w io.Writer, tabtypes string, pattern string, verbose bo
 		GettextNoop("sequence"),
 		GettextNoop("special"),
 		GettextNoop("foreign table"),
-		GettextNoop("table"), /* partitioned table */
-		GettextNoop("index"), /* partitioned index */
+		GettextNoop("partitioned table"),
+		GettextNoop("partitioned index"),
 		GettextNoop("Type"),
 		GettextNoop("Owner"))
 

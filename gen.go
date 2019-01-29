@@ -31,6 +31,7 @@ import (
 const (
 	postgresSrc = "https://raw.githubusercontent.com/postgres/postgres/master/"
 
+	pgcasthURL       = postgresSrc + "src/include/catalog/pg_cast.h"
 	pgclasshURL      = postgresSrc + "src/include/catalog/pg_class.h"
 	pgdefaultaclhURL = postgresSrc + "src/include/catalog/pg_default_acl.h"
 	helpcURL         = postgresSrc + "src/bin/psql/help.c"
@@ -41,7 +42,7 @@ const (
 
 var (
 	flagTTL   = flag.Duration("ttl", 24*time.Hour, "file cache time")
-	flagCache = flag.String("cache", filepath.Join(os.Getenv("GOPATH"), "pkg/pgdesc-gen"), "cache path")
+	flagCache = flag.String("cache", "", "cache path")
 	flagOut   = flag.String("o", filepath.Join(os.Getenv("GOPATH"), "src/github.com/xo/pgdesc/pgdesc.go"), "out")
 	flagDebug = flag.Bool("debug", false, "enable debugging")
 )
@@ -56,15 +57,23 @@ func main() {
 func run() error {
 	var err error
 
-	fc := fileCacher{
-		path: *flagCache,
-		ttl:  *flagTTL,
+	// set cache path
+	if *flagCache == "" {
+		cacheDir, err := os.UserCacheDir()
+		if err != nil {
+			return err
+		}
+		*flagCache = filepath.Join(cacheDir, "pgdesc")
 	}
 
 	consts := make(map[string][2]string)
 
 	// load R* constants in pg_class.h
-	buf, err := fc.Get(pgclasshURL, false, "pg_class.h")
+	buf, err := get(cache{
+		url:  pgclasshURL,
+		path: filepath.Join(*flagCache, "pg_class.h"),
+		ttl:  *flagTTL,
+	})
 	if err != nil {
 		return err
 	}
@@ -72,8 +81,12 @@ func run() error {
 		return err
 	}
 
-	// load R* constants in pg_class.h
-	buf, err = fc.Get(pgdefaultaclhURL, false, "pg_default_acl.h")
+	// load R* constants in pg_default_acl.h
+	buf, err = get(cache{
+		url:  pgdefaultaclhURL,
+		path: filepath.Join(*flagCache, "pg_default_acl.h"),
+		ttl:  *flagTTL,
+	})
 	if err != nil {
 		return err
 	}
@@ -81,8 +94,25 @@ func run() error {
 		return err
 	}
 
+	// load COERCION_* consts in pg_cast.h
+	buf, err = get(cache{
+		url:  pgcasthURL,
+		path: filepath.Join(*flagCache, "pg_cast.h"),
+		ttl:  *flagTTL,
+	})
+	if err != nil {
+		return err
+	}
+	if err = loadCharConsts(buf, "COERCION", consts); err != nil {
+		return err
+	}
+
 	// load \d* comments in describe.h
-	buf, err = fc.Get(describehURL, false, "describe.h")
+	buf, err = get(cache{
+		url:  describehURL,
+		path: filepath.Join(*flagCache, "describe.h"),
+		ttl:  *flagTTL,
+	})
 	if err != nil {
 		return err
 	}
@@ -92,7 +122,11 @@ func run() error {
 	}
 
 	// load \d* help text in help.c
-	buf, err = fc.Get(helpcURL, false, "help.c")
+	buf, err = get(cache{
+		url:  helpcURL,
+		path: filepath.Join(*flagCache, "help.c"),
+		ttl:  *flagTTL,
+	})
 	if err != nil {
 		return err
 	}
@@ -104,7 +138,11 @@ func run() error {
 	logf("consts: %d, comments: %d, help: %d", len(consts), len(comments), len(help))
 
 	// convert describe.c
-	buf, err = fc.Get(describecURL, false, "describe.c")
+	buf, err = get(cache{
+		url:  describecURL,
+		path: filepath.Join(*flagCache, "describe.c"),
+		ttl:  *flagTTL,
+	})
 	if err != nil {
 		return err
 	}
@@ -121,6 +159,21 @@ func loadConsts(buf []byte, typ string, consts map[string][2]string) error {
 	defineRE := regexp.MustCompile(`#define\s+(` + typ + `[A-Z_]+)\s+(.*)`)
 	for _, m := range defineRE.FindAllStringSubmatch(string(buf), -1) {
 		v, comment := m[2], ""
+		if i := strings.IndexAny(v, " \t"); i != -1 {
+			comment, v = strings.TrimSpace(v[i:]), v[:i]
+		}
+		v = strings.Replace(v, "'", "", -1)
+		comment = strings.TrimSpace(strings.TrimPrefix(strings.TrimSuffix(comment, "*/"), "/*"))
+		consts[m[1]] = [2]string{v, comment}
+	}
+	return nil
+}
+
+// loadCharConsts extracts the <typ>_* constants in buf.
+func loadCharConsts(buf []byte, typ string, consts map[string][2]string) error {
+	defineRE := regexp.MustCompile(`\s+(` + typ + `[A-Z_]+)\s+=\s+(.*)`)
+	for _, m := range defineRE.FindAllStringSubmatch(string(buf), -1) {
+		v, comment := strings.Replace(m[2], ",", "", -1), ""
 		if i := strings.IndexAny(v, " \t"); i != -1 {
 			comment, v = strings.TrimSpace(v[i:]), v[:i]
 		}
@@ -624,45 +677,34 @@ var (
 	danglingElseRE = regexp.MustCompile(`(?m)^\s*}\s+else\s*$`)
 )
 
-// fileCacher handles caching files to a path with a ttl.
-type fileCacher struct {
-	path string
-	ttl  time.Duration
+// cache holds information about a cached file.
+type cache struct {
+	path   string
+	ttl    time.Duration
+	decode bool
+	url    string
 }
 
-// Load attempts to load the file from disk, disregarding ttl.
-func (fc fileCacher) Load(names ...string) ([]byte, error) {
-	return ioutil.ReadFile(pathJoin(fc.path, names...))
-}
+// get retrieves a file from disk or from the remote URL, optionally base64
+// decoding it and writing it to disk.
+func get(c cache) ([]byte, error) {
+	var err error
 
-// Cache writes buf to the fileCacher path joined with names.
-func (fc fileCacher) Cache(buf []byte, names ...string) error {
-	logf("WRITING: %s", pathJoin(fc.path, names...))
-	return ioutil.WriteFile(pathJoin(fc.path, names...), buf, 0644)
-}
-
-// Get retrieves a file from disk or from the remote URL, optionally
-// base64 decoding it and writing it to disk.
-func (fc fileCacher) Get(urlstr string, b64Decode bool, names ...string) ([]byte, error) {
-	n := pathJoin(fc.path, names...)
-	cd := filepath.Dir(n)
-	err := os.MkdirAll(cd, 0755)
-	if err != nil {
+	if err = os.MkdirAll(filepath.Dir(c.path), 0755); err != nil {
 		return nil, err
 	}
 
 	// check if exists on disk
-	fi, err := os.Stat(n)
-	if err == nil && fc.ttl != 0 && !time.Now().After(fi.ModTime().Add(fc.ttl)) {
-		// logf("LOADING: %s", n)
-		return ioutil.ReadFile(n)
+	fi, err := os.Stat(c.path)
+	if err == nil && c.ttl != 0 && !time.Now().After(fi.ModTime().Add(c.ttl)) {
+		return ioutil.ReadFile(c.path)
 	}
 
-	logf("RETRIEVING: %s", urlstr)
+	logf("RETRIEVING: %s", c.url)
 
 	// retrieve
 	cl := &http.Client{}
-	req, err := http.NewRequest("GET", urlstr, nil)
+	req, err := http.NewRequest("GET", c.url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -678,15 +720,15 @@ func (fc fileCacher) Get(urlstr string, b64Decode bool, names ...string) ([]byte
 	}
 
 	// decode
-	if b64Decode {
+	if c.decode {
 		buf, err = base64.StdEncoding.DecodeString(string(buf))
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	// write
-	if err = fc.Cache(buf, names...); err != nil {
+	logf("WRITING: %s", c.path)
+	if err = ioutil.WriteFile(c.path, buf, 0644); err != nil {
 		return nil, err
 	}
 
