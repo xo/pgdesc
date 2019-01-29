@@ -40,10 +40,6 @@ const (
 	RELPERSISTENCE_PERMANENT  = 'p' // regular table
 	RELPERSISTENCE_TEMP       = 't' // temporary table
 	RELPERSISTENCE_UNLOGGED   = 'u' // unlogged permanent table
-	REPLICA_IDENTITY_DEFAULT  = 'd'
-	REPLICA_IDENTITY_FULL     = 'f'
-	REPLICA_IDENTITY_INDEX    = 'i'
-	REPLICA_IDENTITY_NOTHING  = 'n'
 )
 
 // AccessMethods handles \dA.

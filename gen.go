@@ -107,6 +107,13 @@ func run() error {
 		return err
 	}
 
+	// clean up consts
+	for k := range consts {
+		if strings.HasPrefix(k, "REPLICA_") {
+			delete(consts, k)
+		}
+	}
+
 	// load \d* comments in describe.h
 	buf, err = get(cache{
 		url:  describehURL,
